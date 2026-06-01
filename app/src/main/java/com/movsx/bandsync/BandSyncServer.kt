@@ -299,11 +299,13 @@ class BandSyncServer(context: Context) : AutoCloseable {
             return
         }
 
-        if (_uiState.value.syncMode == PlaybackSyncMode.DEVICE_TIME && !allVisibleClientsTimeSynced()) {
-            val waitingCount = currentVisibleClients().count { !it.isTimeSyncReady() }
+        val visibleClients = currentVisibleClients()
+        val readyErrorLimitMs = readyTimeSyncErrorLimitMs(visibleClients)
+        if (_uiState.value.syncMode == PlaybackSyncMode.DEVICE_TIME && !allVisibleClientsTimeSynced(visibleClients, readyErrorLimitMs)) {
+            val waitingCount = visibleClients.count { !it.isTimeSyncReady(readyErrorLimitMs) }
             _uiState.update {
                 it.copy(
-                    status = "还有 $waitingCount 个客户端时间同步未稳定，未下发开始命令",
+                    status = "还有 $waitingCount 个客户端时间同步未稳定（动态阈值 ${readyErrorLimitMs}ms），未下发开始命令",
                     errorMessage = null
                 )
             }
@@ -889,11 +891,33 @@ class BandSyncServer(context: Context) : AutoCloseable {
         return visibleClients.all(::isClientCachedForCurrentAudio)
     }
 
-    private fun allVisibleClientsTimeSynced(): Boolean =
-        currentVisibleClients().all { it.isTimeSyncReady() }
+    private fun allVisibleClientsTimeSynced(
+        visibleClients: List<ClientConnectionInfo>,
+        readyErrorLimitMs: Long
+    ): Boolean =
+        visibleClients.isEmpty() || visibleClients.all { it.isTimeSyncReady(readyErrorLimitMs) }
 
-    private fun ClientConnectionInfo.isTimeSyncReady(): Boolean =
-        clockOffsetMs != null && (timeSyncErrorBoundMs ?: Long.MAX_VALUE) <= MAX_READY_TIME_SYNC_ERROR_MS
+    private fun readyTimeSyncErrorLimitMs(clients: List<ClientConnectionInfo>): Long {
+        val observed = clients.mapNotNull { client ->
+            val latency = client.signalLatencyMs
+            val error = client.timeSyncErrorBoundMs
+            when {
+                error != null -> error
+                latency != null -> latency / 2L
+                else -> null
+            }
+        }
+        if (observed.isEmpty()) return BASE_READY_TIME_SYNC_ERROR_MS
+
+        val sorted = observed.sorted()
+        val median = sorted[sorted.size / 2]
+        val high = sorted[((sorted.size - 1) * 75) / 100]
+        return (maxOf(median * 2L, high + READY_TIME_SYNC_ERROR_MARGIN_MS))
+            .coerceIn(MIN_READY_TIME_SYNC_ERROR_MS, MAX_READY_TIME_SYNC_ERROR_MS)
+    }
+
+    private fun ClientConnectionInfo.isTimeSyncReady(errorLimitMs: Long): Boolean =
+        clockOffsetMs != null && (timeSyncErrorBoundMs ?: Long.MAX_VALUE) <= errorLimitMs
 
     private fun isClientCachedForCurrentAudio(client: TrackedClient): Boolean =
         client.cachedAudioRevision == audioRevision && client.cacheStatus == "cached"
@@ -1129,7 +1153,10 @@ class BandSyncServer(context: Context) : AutoCloseable {
 
     private companion object {
         const val DEVICE_TIME_COMMAND_LEAD_MS = 3_000L
-        const val MAX_READY_TIME_SYNC_ERROR_MS = 50L
+        const val BASE_READY_TIME_SYNC_ERROR_MS = 500L
+        const val MIN_READY_TIME_SYNC_ERROR_MS = 250L
+        const val MAX_READY_TIME_SYNC_ERROR_MS = 1_500L
+        const val READY_TIME_SYNC_ERROR_MARGIN_MS = 200L
         const val PRECISE_WAIT_WINDOW_MS = 12L
         const val PRE_SEEK_TOLERANCE_MS = 25L
         const val EVENT_KEEPALIVE_MS = 30_000L

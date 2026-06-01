@@ -328,7 +328,13 @@ class BandSyncClient(context: Context) : AutoCloseable {
         val bestOffsetSample = timeSamples.minByOrNull { it.roundTripMs } ?: return
         val sortedLatencies = timeSamples.map { it.roundTripMs }.sorted()
         val medianLatency = sortedLatencies[sortedLatencies.size / 2]
-        val latencyJitterMs = (sortedLatencies.last() - sortedLatencies.first()).coerceAtLeast(0L)
+        val latencyJitterMs = sortedLatencies
+            .let { sorted ->
+                val lowIndex = ((sorted.size - 1) * 25) / 100
+                val highIndex = ((sorted.size - 1) * 75) / 100
+                sorted[highIndex] - sorted[lowIndex]
+            }
+            .coerceAtLeast(0L)
 
         signalLatencyMs = smoothValue(signalLatencyMs, medianLatency, previousWeight = 3)
         clockOffsetMs = smoothOffset(clockOffsetMs, bestOffsetSample.offsetMs)
@@ -994,8 +1000,8 @@ class BandSyncClient(context: Context) : AutoCloseable {
         const val INITIAL_TIME_SYNC_SAMPLES = 5
         const val FAST_TIME_SYNC_INTERVAL_MS = 500L
         const val TIME_SYNC_INTERVAL_MS = 3_000L
-        const val TIME_SYNC_SAMPLE_WINDOW = 9
-        const val MAX_ACCEPTED_TIME_SYNC_RTT_MS = 2_000L
+        const val TIME_SYNC_SAMPLE_WINDOW = 15
+        const val MAX_ACCEPTED_TIME_SYNC_RTT_MS = 4_000L
         const val CLOCK_OFFSET_JUMP_RESET_MS = 1_000L
         const val PRE_PLAY_TIME_SYNC_ATTEMPTS = 2
         const val PRE_PLAY_TIME_SYNC_TIMEOUT_MS = 600
