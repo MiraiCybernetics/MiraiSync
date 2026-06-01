@@ -1,0 +1,34 @@
+# Gradle
+.gradle/
+.kotlin/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local SDK / machine config
+local.properties
+*.local
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+
+# Android generated files
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+*.idsig
+*.hprof
+
+# Signing keys - keep real or test keys out of source control
+*.jks
+*.keystore
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
