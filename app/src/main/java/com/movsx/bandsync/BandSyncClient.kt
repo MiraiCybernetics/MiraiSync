@@ -77,12 +77,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
         _uiState.update { it.copy(portInput = filtered, errorMessage = null) }
     }
 
-    fun setLocalVolume(value: Float) {
-        val volume = value.coerceIn(0f, 1f)
-        _uiState.update { it.copy(localVolume = volume) }
-        applyPlayerVolume()
-    }
-
     fun connect() {
         if (_uiState.value.isConnected) return
 
@@ -142,7 +136,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
                 isCachingRemoteAudio = false,
                 cacheProgress = cacheProgressPercent / 100f,
                 cachedAudioRevision = cachedAudioRevision,
-                remoteVolume = 1f,
                 status = "已断开"
             )
         }
@@ -338,7 +331,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
                 cacheProgress = cacheProgressPercent / 100f,
                 cachedAudioRevision = cachedAudioRevision,
                 durationMs = snapshot.durationMs,
-                remoteVolume = snapshot.clientVolume,
                 status = statusForSnapshot(snapshot),
                 errorMessage = null
             )
@@ -415,7 +407,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
                 )
                 setOnPreparedListener {
                     playerPrepared = true
-                    applyPlayerVolume()
                     latestSnapshot?.let { snapshot -> applyRemoteCommandIfReady(snapshot) }
                 }
                 setOnCompletionListener {
@@ -499,7 +490,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
         }
 
         runCatching {
-            applyPlayerVolume()
             seekToCompat(mediaPlayer, target)
             mediaPlayer.start()
             _uiState.update {
@@ -552,13 +542,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
                 errorMessage = null
             )
         }
-    }
-
-    private fun applyPlayerVolume() {
-        val mediaPlayer = player ?: return
-        val state = _uiState.value
-        val volume = (state.localVolume * state.remoteVolume).coerceIn(0f, 1f)
-        runCatching { mediaPlayer.setVolume(volume, volume) }
     }
 
     private fun releasePlayer() {
@@ -798,7 +781,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
             durationMs = json.optLong("durationMs", 0L),
             audioRevision = json.optLong("audioRevision", 0L),
             audioSizeBytes = json.optLong("audioSizeBytes", 0L),
-            clientVolume = json.optDouble("clientVolume", 1.0).toFloat().coerceIn(0f, 1f),
             commandId = json.optLong("commandId", 0L),
             command = parseCommand(json.optString("command", RemoteCommand.IDLE.name)),
             syncMode = parseSyncMode(json.optString("syncMode", PlaybackSyncMode.DEVICE_TIME.name)),

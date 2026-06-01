@@ -55,8 +55,6 @@ data class ServerUiState(
     val isGeneratingBeat: Boolean = false,
     val detectedBpm: Int? = null,
     val detectedBeatOffsetMs: Long? = null,
-    val serverVolume: Float = 1f,
-    val clientsVolume: Float = 1f,
     val clients: List<ClientConnectionInfo> = emptyList(),
     val status: String = "服务器未启动",
     val errorMessage: String? = null
@@ -77,8 +75,6 @@ data class ClientUiState(
     val signalLatencyMs: Long? = null,
     val clockOffsetMs: Long? = null,
     val timeSyncErrorBoundMs: Long? = null,
-    val localVolume: Float = 1f,
-    val remoteVolume: Float = 1f,
     val status: String = "未连接",
     val errorMessage: String? = null
 )
@@ -89,7 +85,6 @@ data class RemoteControlSnapshot(
     val durationMs: Long,
     val audioRevision: Long,
     val audioSizeBytes: Long,
-    val clientVolume: Float,
     val commandId: Long,
     val command: RemoteCommand,
     val syncMode: PlaybackSyncMode,

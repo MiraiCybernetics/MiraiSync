@@ -33,7 +33,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -306,11 +305,6 @@ private fun ServerScreen(server: BandSyncServer, onBack: () -> Unit) {
             }
         }
 
-        Section(title = "音量") {
-            VolumeSlider(label = "本机 Server Output", value = state.serverVolume, onValueChange = server::setServerVolume)
-            VolumeSlider(label = "客户端 Clients Output", value = state.clientsVolume, onValueChange = server::setClientsVolume)
-        }
-
         Section(title = "客户端缓存") {
             if (state.clients.isEmpty()) {
                 Text("暂无客户端连接", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -404,14 +398,6 @@ private fun ClientScreen(client: BandSyncClient, onBack: () -> Unit) {
             ) {
                 Text("清除客户端缓存")
             }
-        }
-
-        Section(title = "本机音量") {
-            VolumeSlider(label = "客户端输出", value = state.localVolume, onValueChange = client::setLocalVolume)
-            Text(
-                text = "服务器音量指令：${(state.remoteVolume * 100).roundToInt()}%",
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
 
         state.errorMessage?.let { ErrorText(it) }
@@ -510,17 +496,6 @@ private fun PlaybackProgress(positionMs: Long, durationMs: Long) {
             Text(formatDuration(positionMs), style = MaterialTheme.typography.bodySmall)
             Text(formatDuration(durationMs), style = MaterialTheme.typography.bodySmall)
         }
-    }
-}
-
-@Composable
-private fun VolumeSlider(label: String, value: Float, onValueChange: (Float) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(label)
-            Text("${(value * 100).roundToInt()}%")
-        }
-        Slider(value = value, onValueChange = onValueChange, valueRange = 0f..1f)
     }
 }
 

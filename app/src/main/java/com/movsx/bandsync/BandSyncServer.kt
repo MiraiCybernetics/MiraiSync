@@ -315,20 +315,6 @@ class BandSyncServer(context: Context) : AutoCloseable {
         issueCommand(RemoteCommand.STOP, 0L, _uiState.value.syncMode)
     }
 
-    fun setServerVolume(value: Float) {
-        val volume = value.coerceIn(0f, 1f)
-        _uiState.update { it.copy(serverVolume = volume) }
-        mainScope.launch {
-            runCatching { serverPlayer?.setVolume(volume, volume) }
-        }
-    }
-
-    fun setClientsVolume(value: Float) {
-        val volume = value.coerceIn(0f, 1f)
-        _uiState.update { it.copy(clientsVolume = volume) }
-        broadcastSnapshot()
-    }
-
     fun clearCache() {
         stopPlayback()
         val oldFile = clientAudioFile
@@ -625,7 +611,6 @@ class BandSyncServer(context: Context) : AutoCloseable {
             .put("durationMs", state.clientAudio?.durationMs ?: 0L)
             .put("audioRevision", audioRevision)
             .put("audioSizeBytes", state.clientAudio?.sizeBytes ?: 0L)
-            .put("clientVolume", state.clientsVolume.toDouble())
             .put("commandId", commandSnapshot.id)
             .put("command", commandSnapshot.command.name)
             .put("syncMode", commandSnapshot.syncMode.name)
@@ -732,7 +717,6 @@ class BandSyncServer(context: Context) : AutoCloseable {
                 setDataSource(appContext, uri)
                 setOnPreparedListener { player ->
                     serverPlayerPrepared = true
-                    player.setVolume(_uiState.value.serverVolume, _uiState.value.serverVolume)
                     val position = currentPlaybackPosition()
                     seekToCompat(player, position)
                     if (synchronized(playbackLock) { isPlaying } && position < player.duration) {
@@ -763,7 +747,6 @@ class BandSyncServer(context: Context) : AutoCloseable {
                 return
             }
             seekToCompat(player, positionMs)
-            player.setVolume(_uiState.value.serverVolume, _uiState.value.serverVolume)
             player.start()
         }
     }
