@@ -820,6 +820,8 @@ class BandSyncServer(context: Context) : AutoCloseable {
             ?: clients[id]?.signalLatencyMs
         val clockOffset = query["clockOffsetMs"]?.toLongOrNull()
             ?: clients[id]?.clockOffsetMs
+        val timeSyncErrorBound = query["timeSyncErrorBoundMs"]?.toLongOrNull()?.takeIf { it >= 0L }
+            ?: clients[id]?.timeSyncErrorBoundMs
         val address = socket.inetAddress?.hostAddress ?: "unknown"
         clients[id] = TrackedClient(
             id = id,
@@ -827,6 +829,7 @@ class BandSyncServer(context: Context) : AutoCloseable {
             address = address,
             signalLatencyMs = signalLatency,
             clockOffsetMs = clockOffset,
+            timeSyncErrorBoundMs = timeSyncErrorBound,
             cachedAudioRevision = cachedRevision,
             cacheStatus = cacheStatus,
             cacheProgressPercent = cacheProgress,
@@ -847,6 +850,7 @@ class BandSyncServer(context: Context) : AutoCloseable {
                     address = it.address,
                     signalLatencyMs = it.signalLatencyMs,
                     clockOffsetMs = it.clockOffsetMs,
+                    timeSyncErrorBoundMs = it.timeSyncErrorBoundMs,
                     cachedAudioRevision = it.cachedAudioRevision,
                     cacheStatus = it.cacheStatus,
                     cacheProgressPercent = it.cacheProgressPercent,
@@ -1072,6 +1076,7 @@ class BandSyncServer(context: Context) : AutoCloseable {
         val address: String,
         val signalLatencyMs: Long?,
         val clockOffsetMs: Long?,
+        val timeSyncErrorBoundMs: Long?,
         val cachedAudioRevision: Long,
         val cacheStatus: String,
         val cacheProgressPercent: Int,

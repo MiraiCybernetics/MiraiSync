@@ -61,6 +61,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
     private var lastAppliedCommandId: Long = 0L
     private var signalLatencyMs: Long? = null
     private var clockOffsetMs: Long? = null
+    private var timeSyncErrorBoundMs: Long? = null
     private var successfulTimeSyncCount: Int = 0
     private val timeSamples = ArrayDeque<TimeSample>()
 
@@ -119,6 +120,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
         lastAppliedCommandId = 0L
         signalLatencyMs = null
         clockOffsetMs = null
+        timeSyncErrorBoundMs = null
         successfulTimeSyncCount = 0
         timeSamples.clear()
         if (cacheStatus == "downloading") {
@@ -136,6 +138,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
                 durationMs = 0L,
                 signalLatencyMs = null,
                 clockOffsetMs = null,
+                timeSyncErrorBoundMs = null,
                 isCachingRemoteAudio = false,
                 cacheProgress = cacheProgressPercent / 100f,
                 cachedAudioRevision = cachedAudioRevision,
@@ -274,10 +277,12 @@ class BandSyncClient(context: Context) : AutoCloseable {
         recordTimeSample(roundTripMs, estimatedOffsetMs)
         val stableLatencyMs = signalLatencyMs ?: roundTripMs
         val stableOffsetMs = clockOffsetMs ?: estimatedOffsetMs
+        val stableErrorBoundMs = timeSyncErrorBoundMs ?: estimatedErrorBound(roundTripMs, 0L)
         _uiState.update {
             it.copy(
                 signalLatencyMs = stableLatencyMs,
-                clockOffsetMs = stableOffsetMs
+                clockOffsetMs = stableOffsetMs,
+                timeSyncErrorBoundMs = stableErrorBoundMs
             )
         }
         reportClientStatus(force = true)
@@ -292,13 +297,17 @@ class BandSyncClient(context: Context) : AutoCloseable {
         }
 
         val bestOffsetSample = timeSamples.minByOrNull { it.roundTripMs } ?: return
-        val medianLatency = timeSamples
-            .map { it.roundTripMs }
-            .sorted()
-            .let { it[it.size / 2] }
+        val sortedLatencies = timeSamples.map { it.roundTripMs }.sorted()
+        val medianLatency = sortedLatencies[sortedLatencies.size / 2]
+        val latencyJitterMs = (sortedLatencies.last() - sortedLatencies.first()).coerceAtLeast(0L)
 
         signalLatencyMs = smoothValue(signalLatencyMs, medianLatency, previousWeight = 3)
         clockOffsetMs = smoothOffset(clockOffsetMs, bestOffsetSample.offsetMs)
+        timeSyncErrorBoundMs = smoothValue(
+            timeSyncErrorBoundMs,
+            estimatedErrorBound(bestOffsetSample.roundTripMs, latencyJitterMs),
+            previousWeight = 2
+        )
         successfulTimeSyncCount += 1
     }
 
@@ -308,6 +317,9 @@ class BandSyncClient(context: Context) : AutoCloseable {
         } else {
             ((current * previousWeight) + candidate) / (previousWeight + 1)
         }
+
+    private fun estimatedErrorBound(bestRoundTripMs: Long, latencyJitterMs: Long): Long =
+        (bestRoundTripMs / 2L + latencyJitterMs / 2L).coerceAtLeast(1L)
 
     private fun smoothOffset(current: Long?, candidate: Long): Long {
         if (current == null) return candidate
@@ -452,6 +464,11 @@ class BandSyncClient(context: Context) : AutoCloseable {
     private fun scheduleRemoteCommand(snapshot: RemoteControlSnapshot) {
         commandJob?.cancel()
         commandJob = mainScope.launch {
+            if (snapshot.command == RemoteCommand.PLAY && snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME) {
+                repeat(PRE_PLAY_TIME_SYNC_ATTEMPTS) {
+                    runCatching { measureTimeDifference() }
+                }
+            }
             val delayMs = commandDelayMs(snapshot)
             if (delayMs > 0L) delay(delayMs)
             when (snapshot.command) {
@@ -723,6 +740,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
         releasePlayer()
         signalLatencyMs = null
         clockOffsetMs = null
+        timeSyncErrorBoundMs = null
         successfulTimeSyncCount = 0
         timeSamples.clear()
         _uiState.update {
@@ -731,6 +749,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
                 isPlaying = false,
                 signalLatencyMs = null,
                 clockOffsetMs = null,
+                timeSyncErrorBoundMs = null,
                 status = "连接已断开",
                 errorMessage = message
             )
@@ -765,6 +784,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
         append("&cacheProgress=").append(cacheProgressPercent)
         signalLatencyMs?.let { append("&signalLatencyMs=").append(it) }
         clockOffsetMs?.let { append("&clockOffsetMs=").append(it) }
+        timeSyncErrorBoundMs?.let { append("&timeSyncErrorBoundMs=").append(it) }
     }
 
     private fun parseSnapshot(response: String): RemoteControlSnapshot =
@@ -854,5 +874,6 @@ class BandSyncClient(context: Context) : AutoCloseable {
         const val TIME_SYNC_SAMPLE_WINDOW = 9
         const val MAX_ACCEPTED_TIME_SYNC_RTT_MS = 2_000L
         const val CLOCK_OFFSET_JUMP_RESET_MS = 1_000L
+        const val PRE_PLAY_TIME_SYNC_ATTEMPTS = 2
     }
 }

@@ -364,6 +364,10 @@ private fun ClientScreen(client: BandSyncClient, onBack: () -> Unit) {
                 text = "时间差：${state.clockOffsetMs?.let { formatSignedMs(it) } ?: "--"}（服务端 - 本机）",
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            Text(
+                text = "估算误差：${state.timeSyncErrorBoundMs?.let { "±$it ms" } ?: "--"}（已考虑延迟/抖动）",
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
 
         Section(title = "远端音频") {
@@ -538,6 +542,11 @@ private fun ClientInfoRow(client: ClientConnectionInfo) {
                 Text(client.address, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
                     text = "信号延迟：${client.signalLatencyMs?.let { "$it ms" } ?: "--"} · 时间差：${client.clockOffsetMs?.let { formatSignedMs(it) } ?: "--"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "估算误差：${client.timeSyncErrorBoundMs?.let { "±$it ms" } ?: "--"}（含延迟/抖动）",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
