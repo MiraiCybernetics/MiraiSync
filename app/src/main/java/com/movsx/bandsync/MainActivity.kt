@@ -526,6 +526,11 @@ private fun ClientInfoRow(client: ClientConnectionInfo) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
+                    text = "上次开始偏差：${client.lastStartDeltaMs?.let { formatSignedMs(it) } ?: "--"} · 自动校正：${client.startCorrectionMs?.let { formatSignedMs(it) } ?: "--"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
                     text = client.cacheDescription(),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant

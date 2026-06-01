@@ -31,6 +31,8 @@ data class ClientConnectionInfo(
     val signalLatencyMs: Long?,
     val clockOffsetMs: Long?,
     val timeSyncErrorBoundMs: Long?,
+    val lastStartDeltaMs: Long?,
+    val startCorrectionMs: Long?,
     val cachedAudioRevision: Long,
     val cacheStatus: String,
     val cacheProgressPercent: Int,

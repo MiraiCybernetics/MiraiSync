@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.os.Build
+import android.os.SystemClock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -49,7 +50,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
     private var timeSyncJob: Job? = null
     private var eventConnection: HttpURLConnection? = null
     private var player: MediaPlayer? = null
-    private var playerPrepared = false
+    private var playerReady = false
     private var currentAudioRevision = -1L
     private var latestSnapshot: RemoteControlSnapshot? = null
     private var cachedAudioFile: File? = null
@@ -62,6 +63,10 @@ class BandSyncClient(context: Context) : AutoCloseable {
     private var signalLatencyMs: Long? = null
     private var clockOffsetMs: Long? = null
     private var timeSyncErrorBoundMs: Long? = null
+    private var serverWallClockAtReferenceMs: Long? = null
+    private var referenceElapsedRealtimeMs: Long? = null
+    private var lastStartDeltaMs: Long? = null
+    private var startCorrectionMs: Long = 0L
     private var successfulTimeSyncCount: Int = 0
     private val timeSamples = ArrayDeque<TimeSample>()
 
@@ -115,6 +120,10 @@ class BandSyncClient(context: Context) : AutoCloseable {
         signalLatencyMs = null
         clockOffsetMs = null
         timeSyncErrorBoundMs = null
+        serverWallClockAtReferenceMs = null
+        referenceElapsedRealtimeMs = null
+        lastStartDeltaMs = null
+        startCorrectionMs = 0L
         successfulTimeSyncCount = 0
         timeSamples.clear()
         if (cacheStatus == "downloading") {
@@ -249,10 +258,20 @@ class BandSyncClient(context: Context) : AutoCloseable {
         }
     }
 
-    private suspend fun measureTimeDifference() {
+    private suspend fun measureTimeDifference(
+        connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
+        readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS
+    ) {
         val clientSendWallClockMs = System.currentTimeMillis()
-        val response = httpGet("$baseUrl/time-sync?${clientQuery()}&clientSendWallClockMs=$clientSendWallClockMs")
-        val clientReceiveWallClockMs = System.currentTimeMillis()
+        val clientSendElapsedMs = SystemClock.elapsedRealtime()
+        val response = httpGet(
+            "$baseUrl/time-sync?${clientQuery()}&clientSendWallClockMs=$clientSendWallClockMs",
+            connectTimeoutMs = connectTimeoutMs,
+            readTimeoutMs = readTimeoutMs
+        )
+        val clientReceiveElapsedMs = SystemClock.elapsedRealtime()
+        // Derive receive wall time from elapsed time so a device clock adjustment during the probe does not skew RTT.
+        val clientReceiveWallClockMs = clientSendWallClockMs + (clientReceiveElapsedMs - clientSendElapsedMs)
         val json = JSONObject(response)
         val serverReceiveWallClockMs = json.optLong("serverReceiveWallClockMs", 0L)
         val serverSendWallClockMs = json.optLong("serverSendWallClockMs", serverReceiveWallClockMs)
@@ -260,14 +279,19 @@ class BandSyncClient(context: Context) : AutoCloseable {
 
         val serverProcessingMs = (serverSendWallClockMs - serverReceiveWallClockMs).coerceAtLeast(0L)
         val roundTripMs = (
-            clientReceiveWallClockMs - clientSendWallClockMs - serverProcessingMs
+            clientReceiveElapsedMs - clientSendElapsedMs - serverProcessingMs
         ).coerceAtLeast(0L)
         val estimatedOffsetMs = (
             (serverReceiveWallClockMs - clientSendWallClockMs) +
                 (serverSendWallClockMs - clientReceiveWallClockMs)
         ) / 2L
 
-        recordTimeSample(roundTripMs, estimatedOffsetMs)
+        recordTimeSample(
+            roundTripMs = roundTripMs,
+            offsetMs = estimatedOffsetMs,
+            clientReceiveWallClockMs = clientReceiveWallClockMs,
+            clientReceiveElapsedMs = clientReceiveElapsedMs
+        )
         val stableLatencyMs = signalLatencyMs ?: roundTripMs
         val stableOffsetMs = clockOffsetMs ?: estimatedOffsetMs
         val stableErrorBoundMs = timeSyncErrorBoundMs ?: estimatedErrorBound(roundTripMs, 0L)
@@ -281,10 +305,22 @@ class BandSyncClient(context: Context) : AutoCloseable {
         reportClientStatus(force = true)
     }
 
-    private fun recordTimeSample(roundTripMs: Long, offsetMs: Long) {
+    private fun recordTimeSample(
+        roundTripMs: Long,
+        offsetMs: Long,
+        clientReceiveWallClockMs: Long,
+        clientReceiveElapsedMs: Long
+    ) {
         if (roundTripMs > MAX_ACCEPTED_TIME_SYNC_RTT_MS) return
 
-        timeSamples.addLast(TimeSample(roundTripMs = roundTripMs, offsetMs = offsetMs))
+        timeSamples.addLast(
+            TimeSample(
+                roundTripMs = roundTripMs,
+                offsetMs = offsetMs,
+                clientReceiveWallClockMs = clientReceiveWallClockMs,
+                clientReceiveElapsedMs = clientReceiveElapsedMs
+            )
+        )
         while (timeSamples.size > TIME_SYNC_SAMPLE_WINDOW) {
             timeSamples.removeFirst()
         }
@@ -296,6 +332,10 @@ class BandSyncClient(context: Context) : AutoCloseable {
 
         signalLatencyMs = smoothValue(signalLatencyMs, medianLatency, previousWeight = 3)
         clockOffsetMs = smoothOffset(clockOffsetMs, bestOffsetSample.offsetMs)
+        clockOffsetMs?.let { stableOffsetMs ->
+            serverWallClockAtReferenceMs = clientReceiveWallClockMs + stableOffsetMs
+            referenceElapsedRealtimeMs = clientReceiveElapsedMs
+        }
         timeSyncErrorBoundMs = smoothValue(
             timeSyncErrorBoundMs,
             estimatedErrorBound(bestOffsetSample.roundTripMs, latencyJitterMs),
@@ -351,6 +391,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
         if (player == null || currentAudioRevision != snapshot.audioRevision) {
             prepareLocalPlayer(snapshot.audioRevision)
         }
+        preSeekForScheduledPlayback(snapshot)
         applyRemoteCommandIfReady(snapshot)
     }
 
@@ -395,7 +436,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
 
         releasePlayer()
         currentAudioRevision = audioRevision
-        playerPrepared = false
+        playerReady = false
 
         try {
             player = MediaPlayer().apply {
@@ -405,24 +446,21 @@ class BandSyncClient(context: Context) : AutoCloseable {
                         .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                         .build()
                 )
-                setOnPreparedListener {
-                    playerPrepared = true
-                    latestSnapshot?.let { snapshot -> applyRemoteCommandIfReady(snapshot) }
-                }
                 setOnCompletionListener {
                     _uiState.update { state ->
                         state.copy(isPlaying = false, playbackPositionMs = state.durationMs)
                     }
                 }
                 setOnErrorListener { _, _, _ ->
-                    playerPrepared = false
+                    playerReady = false
                     releasePlayer()
                     currentAudioRevision = -1L
                     _uiState.update { it.copy(errorMessage = "本地缓存音频播放失败，请清除缓存后重试") }
                     true
                 }
                 setDataSource(localFile.absolutePath)
-                prepareAsync()
+                prepare()
+                playerReady = true
             }
         } catch (error: Exception) {
             releasePlayer()
@@ -433,8 +471,33 @@ class BandSyncClient(context: Context) : AutoCloseable {
         }
     }
 
+    private fun preSeekForScheduledPlayback(snapshot: RemoteControlSnapshot) {
+        if (snapshot.command != RemoteCommand.PLAY || snapshot.syncMode != PlaybackSyncMode.DEVICE_TIME) return
+        val mediaPlayer = player ?: return
+        if (!playerReady || snapshot.durationMs <= 0L) return
+
+        val targetElapsedMs = correctedTargetElapsedRealtimeMs(snapshot.executeAtWallClockMs) ?: return
+        val remainingMs = targetElapsedMs - SystemClock.elapsedRealtime()
+        if (remainingMs !in PRE_SEEK_MIN_LEAD_MS..PRE_SEEK_MAX_LEAD_MS) return
+
+        runCatching {
+            val target = snapshot.startPositionMs.coerceIn(0L, snapshot.durationMs)
+            seekToCompat(mediaPlayer, target)
+        }
+    }
+
     private fun applyRemoteCommandIfReady(snapshot: RemoteControlSnapshot) {
         if (snapshot.commandId <= lastAppliedCommandId) return
+
+        val delayBeforeTargetMs = if (
+            snapshot.command == RemoteCommand.PLAY &&
+            snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME &&
+            snapshot.executeAtWallClockMs > 0L
+        ) {
+            snapshot.executeAtWallClockMs - estimatedServerWallClockMs()
+        } else {
+            Long.MAX_VALUE
+        }
 
         if (snapshot.command == RemoteCommand.PLAY) {
             if (cachedAudioRevision != snapshot.audioRevision || cachedAudioFile?.exists() != true) {
@@ -442,10 +505,11 @@ class BandSyncClient(context: Context) : AutoCloseable {
                 return
             }
             if (player == null || currentAudioRevision != snapshot.audioRevision) {
+                lastAppliedCommandId = snapshot.commandId
                 prepareLocalPlayer(snapshot.audioRevision)
                 return
             }
-            if (!playerPrepared) return
+            if (!playerReady && delayBeforeTargetMs > MIN_PREPARE_WAIT_BEFORE_TARGET_MS) return
         }
 
         lastAppliedCommandId = snapshot.commandId
@@ -457,11 +521,15 @@ class BandSyncClient(context: Context) : AutoCloseable {
         commandJob = mainScope.launch {
             if (snapshot.command == RemoteCommand.PLAY && snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME) {
                 repeat(PRE_PLAY_TIME_SYNC_ATTEMPTS) {
-                    runCatching { measureTimeDifference() }
+                    runCatching {
+                        measureTimeDifference(
+                            connectTimeoutMs = PRE_PLAY_TIME_SYNC_TIMEOUT_MS,
+                            readTimeoutMs = PRE_PLAY_TIME_SYNC_TIMEOUT_MS
+                        )
+                    }
                 }
             }
-            val delayMs = commandDelayMs(snapshot)
-            if (delayMs > 0L) delay(delayMs)
+            waitUntilCommandTime(snapshot)
             when (snapshot.command) {
                 RemoteCommand.PLAY -> startLocalPlayback(snapshot)
                 RemoteCommand.PAUSE -> pauseLocalPlayback("已按服务端命令暂停")
@@ -473,13 +541,25 @@ class BandSyncClient(context: Context) : AutoCloseable {
 
     private fun startLocalPlayback(snapshot: RemoteControlSnapshot) {
         val mediaPlayer = player ?: return
-        if (!playerPrepared) return
+        if (!playerReady) {
+            runCatching { mediaPlayer.prepare() }
+                .onFailure {
+                    _uiState.update { state -> state.copy(errorMessage = "开始播放前准备本地缓存音频失败") }
+                    return
+                }
+            playerReady = true
+        }
 
         val latenessMs = if (
             snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME &&
             snapshot.executeAtWallClockMs > 0L
         ) {
-            (estimatedServerWallClockMs() - snapshot.executeAtWallClockMs).coerceAtLeast(0L)
+            val targetElapsedMs = correctedTargetElapsedRealtimeMs(snapshot.executeAtWallClockMs)
+            if (targetElapsedMs != null) {
+                (SystemClock.elapsedRealtime() - targetElapsedMs).coerceAtLeast(0L)
+            } else {
+                (estimatedServerWallClockMs() - snapshot.executeAtWallClockMs).coerceAtLeast(0L)
+            }
         } else {
             0L
         }
@@ -490,8 +570,21 @@ class BandSyncClient(context: Context) : AutoCloseable {
         }
 
         runCatching {
-            seekToCompat(mediaPlayer, target)
+            val uncorrectedTargetElapsedMs = if (
+                snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME &&
+                snapshot.executeAtWallClockMs > 0L
+            ) {
+                targetElapsedRealtimeMs(snapshot.executeAtWallClockMs)
+            } else {
+                null
+            }
+            if (uncorrectedTargetElapsedMs == null || kotlin.math.abs(mediaPlayer.currentPosition.toLong() - target) > PRE_SEEK_TOLERANCE_MS) {
+                seekToCompat(mediaPlayer, target)
+            }
             mediaPlayer.start()
+            val actualStartElapsedMs = SystemClock.elapsedRealtime()
+            lastStartDeltaMs = uncorrectedTargetElapsedMs?.let { actualStartElapsedMs - it }
+            updateStartCorrection(lastStartDeltaMs)
             _uiState.update {
                 it.copy(
                     isPlaying = true,
@@ -500,6 +593,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
                     errorMessage = null
                 )
             }
+            reportClientStatus(force = true)
         }.onFailure { error ->
             _uiState.update { it.copy(errorMessage = error.localizedMessage ?: "播放失败") }
         }
@@ -508,7 +602,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
     private fun pauseLocalPlayback(status: String) {
         val position = runCatching {
             val mediaPlayer = player
-            if (playerPrepared && mediaPlayer != null) {
+            if (playerReady && mediaPlayer != null) {
                 if (mediaPlayer.isPlaying) mediaPlayer.pause()
                 mediaPlayer.currentPosition.toLong()
             } else {
@@ -529,7 +623,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
     private fun stopLocalPlayback(status: String) {
         runCatching {
             val mediaPlayer = player
-            if (playerPrepared && mediaPlayer != null) {
+            if (playerReady && mediaPlayer != null) {
                 if (mediaPlayer.isPlaying) mediaPlayer.pause()
                 seekToCompat(mediaPlayer, 0L)
             }
@@ -548,7 +642,7 @@ class BandSyncClient(context: Context) : AutoCloseable {
         runCatching {
             player?.release()
             player = null
-            playerPrepared = false
+            playerReady = false
         }
     }
 
@@ -724,6 +818,10 @@ class BandSyncClient(context: Context) : AutoCloseable {
         signalLatencyMs = null
         clockOffsetMs = null
         timeSyncErrorBoundMs = null
+        serverWallClockAtReferenceMs = null
+        referenceElapsedRealtimeMs = null
+        lastStartDeltaMs = null
+        startCorrectionMs = 0L
         successfulTimeSyncCount = 0
         timeSamples.clear()
         _uiState.update {
@@ -768,6 +866,8 @@ class BandSyncClient(context: Context) : AutoCloseable {
         signalLatencyMs?.let { append("&signalLatencyMs=").append(it) }
         clockOffsetMs?.let { append("&clockOffsetMs=").append(it) }
         timeSyncErrorBoundMs?.let { append("&timeSyncErrorBoundMs=").append(it) }
+        lastStartDeltaMs?.let { append("&lastStartDeltaMs=").append(it) }
+        if (startCorrectionMs != 0L) append("&startCorrectionMs=").append(startCorrectionMs)
     }
 
     private fun parseSnapshot(response: String): RemoteControlSnapshot =
@@ -789,11 +889,15 @@ class BandSyncClient(context: Context) : AutoCloseable {
         )
     }
 
-    private suspend fun httpGet(url: String): String = withContext(Dispatchers.IO) {
+    private suspend fun httpGet(
+        url: String,
+        connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
+        readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS
+    ): String = withContext(Dispatchers.IO) {
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 2_000
-            readTimeout = 4_000
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
             useCaches = false
         }
 
@@ -810,15 +914,50 @@ class BandSyncClient(context: Context) : AutoCloseable {
         }
     }
 
-    private fun commandDelayMs(snapshot: RemoteControlSnapshot): Long =
-        if (snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME) {
-            (snapshot.executeAtWallClockMs - estimatedServerWallClockMs()).coerceAtLeast(0L)
-        } else {
-            0L
+    private suspend fun waitUntilCommandTime(snapshot: RemoteControlSnapshot) {
+        if (snapshot.syncMode != PlaybackSyncMode.DEVICE_TIME) return
+        val targetElapsedMs = correctedTargetElapsedRealtimeMs(snapshot.executeAtWallClockMs)
+        if (targetElapsedMs != null) {
+            waitUntilElapsedRealtime(targetElapsedMs)
+            return
         }
+        val delayMs = (snapshot.executeAtWallClockMs - estimatedServerWallClockMs()).coerceAtLeast(0L)
+        if (delayMs > 0L) delay(delayMs)
+    }
+
+    private suspend fun waitUntilElapsedRealtime(targetElapsedMs: Long) {
+        while (true) {
+            val remainingMs = targetElapsedMs - SystemClock.elapsedRealtime()
+            when {
+                remainingMs <= 0L -> return
+                remainingMs > PRECISE_WAIT_WINDOW_MS -> delay(remainingMs - PRECISE_WAIT_WINDOW_MS)
+                remainingMs > 2L -> delay(1L)
+                else -> Thread.yield()
+            }
+        }
+    }
+
+    private fun targetElapsedRealtimeMs(serverWallClockMs: Long): Long? {
+        val referenceServerWallMs = serverWallClockAtReferenceMs ?: return null
+        val referenceElapsedMs = referenceElapsedRealtimeMs ?: return null
+        return referenceElapsedMs + (serverWallClockMs - referenceServerWallMs)
+    }
+
+    private fun correctedTargetElapsedRealtimeMs(serverWallClockMs: Long): Long? =
+        targetElapsedRealtimeMs(serverWallClockMs)?.let { it - startCorrectionMs }
+
+    private fun updateStartCorrection(measuredDeltaMs: Long?) {
+        val deltaMs = measuredDeltaMs ?: return
+        if (kotlin.math.abs(deltaMs) > MAX_START_CORRECTION_SAMPLE_MS) return
+        startCorrectionMs = smoothValue(startCorrectionMs, deltaMs, previousWeight = START_CORRECTION_PREVIOUS_WEIGHT)
+            .coerceIn(-MAX_START_CORRECTION_MS, MAX_START_CORRECTION_MS)
+    }
 
     private fun estimatedServerWallClockMs(): Long =
-        System.currentTimeMillis() + (clockOffsetMs ?: 0L)
+        serverWallClockAtReferenceMs?.let { referenceServerWallMs ->
+            val referenceElapsedMs = referenceElapsedRealtimeMs ?: return@let null
+            referenceServerWallMs + (SystemClock.elapsedRealtime() - referenceElapsedMs)
+        } ?: (System.currentTimeMillis() + (clockOffsetMs ?: 0L))
 
     private fun seekToCompat(player: MediaPlayer, positionMs: Long) {
         player.seekTo(positionMs.coerceAtLeast(0L), MediaPlayer.SEEK_CLOSEST)
@@ -842,7 +981,9 @@ class BandSyncClient(context: Context) : AutoCloseable {
 
     private data class TimeSample(
         val roundTripMs: Long,
-        val offsetMs: Long
+        val offsetMs: Long,
+        val clientReceiveWallClockMs: Long,
+        val clientReceiveElapsedMs: Long
     )
 
     private companion object {
@@ -857,5 +998,16 @@ class BandSyncClient(context: Context) : AutoCloseable {
         const val MAX_ACCEPTED_TIME_SYNC_RTT_MS = 2_000L
         const val CLOCK_OFFSET_JUMP_RESET_MS = 1_000L
         const val PRE_PLAY_TIME_SYNC_ATTEMPTS = 2
+        const val PRE_PLAY_TIME_SYNC_TIMEOUT_MS = 600
+        const val PRECISE_WAIT_WINDOW_MS = 12L
+        const val MIN_PREPARE_WAIT_BEFORE_TARGET_MS = 500L
+        const val PRE_SEEK_MIN_LEAD_MS = 200L
+        const val PRE_SEEK_MAX_LEAD_MS = 1_500L
+        const val PRE_SEEK_TOLERANCE_MS = 25L
+        const val MAX_START_CORRECTION_SAMPLE_MS = 250L
+        const val MAX_START_CORRECTION_MS = 120L
+        const val START_CORRECTION_PREVIOUS_WEIGHT = 3
+        const val DEFAULT_CONNECT_TIMEOUT_MS = 2_000
+        const val DEFAULT_READ_TIMEOUT_MS = 4_000
     }
 }
