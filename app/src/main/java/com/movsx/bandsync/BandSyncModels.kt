@@ -11,6 +11,7 @@ enum class PlaybackSyncMode(val displayName: String) {
 
 enum class RemoteCommand {
     IDLE,
+    PREPARE,
     PLAY,
     PAUSE,
     STOP

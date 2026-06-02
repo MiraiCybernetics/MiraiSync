@@ -54,6 +54,7 @@ class BandSyncServer(context: Context) : AutoCloseable {
     private var acceptJob: Job? = null
     private var tickJob: Job? = null
     private var scheduledCommandJob: Job? = null
+    private var networkSignalWarmupJob: Job? = null
     private var serverPlayer: MediaPlayer? = null
     private var serverPlayerPrepared = false
     private var clientAudioFile: File? = null
@@ -122,9 +123,11 @@ class BandSyncServer(context: Context) : AutoCloseable {
         acceptJob?.cancel()
         tickJob?.cancel()
         scheduledCommandJob?.cancel()
+        networkSignalWarmupJob?.cancel()
         acceptJob = null
         tickJob = null
         scheduledCommandJob = null
+        networkSignalWarmupJob = null
         runCatching { serverSocket?.close() }
         serverSocket = null
         clients.clear()
@@ -315,16 +318,25 @@ class BandSyncServer(context: Context) : AutoCloseable {
         val startPosition = synchronized(playbackLock) {
             if (pausedPositionMs >= duration) 0L else pausedPositionMs.coerceAtLeast(0L)
         }
-        issueCommand(RemoteCommand.PLAY, startPosition, _uiState.value.syncMode)
+        val mode = _uiState.value.syncMode
+        if (mode == PlaybackSyncMode.NETWORK_SIGNAL) {
+            issueNetworkSignalPlay(startPosition)
+        } else {
+            issueCommand(RemoteCommand.PLAY, startPosition, mode)
+        }
     }
 
     fun pausePlayback() {
         if (_uiState.value.durationMs <= 0L) return
+        networkSignalWarmupJob?.cancel()
+        networkSignalWarmupJob = null
         issueCommand(RemoteCommand.PAUSE, currentPlaybackPosition(), _uiState.value.syncMode)
     }
 
     fun stopPlayback() {
         if (_uiState.value.durationMs <= 0L) return
+        networkSignalWarmupJob?.cancel()
+        networkSignalWarmupJob = null
         issueCommand(RemoteCommand.STOP, 0L, _uiState.value.syncMode)
     }
 
@@ -375,6 +387,22 @@ class BandSyncServer(context: Context) : AutoCloseable {
         runCatching { clientAudioFile?.delete() }
     }
 
+    private fun issueNetworkSignalPlay(startPositionMs: Long) {
+        networkSignalWarmupJob?.cancel()
+        issueCommand(RemoteCommand.PREPARE, startPositionMs, PlaybackSyncMode.NETWORK_SIGNAL)
+        networkSignalWarmupJob = mainScope.launch {
+            delay(NETWORK_SIGNAL_WARMUP_MS)
+            val shouldPlay = synchronized(playbackLock) {
+                currentCommand == RemoteCommand.PREPARE &&
+                    commandSyncMode == PlaybackSyncMode.NETWORK_SIGNAL &&
+                    commandStartPositionMs == startPositionMs.coerceAtLeast(0L)
+            }
+            if (shouldPlay) {
+                issueCommand(RemoteCommand.PLAY, startPositionMs, PlaybackSyncMode.NETWORK_SIGNAL)
+            }
+        }
+    }
+
     private fun issueCommand(command: RemoteCommand, startPositionMs: Long, mode: PlaybackSyncMode) {
         val issueElapsedMs = SystemClock.elapsedRealtime()
         val executeAtWallClockMs = if (mode == PlaybackSyncMode.DEVICE_TIME && command == RemoteCommand.PLAY) {
@@ -421,11 +449,33 @@ class BandSyncServer(context: Context) : AutoCloseable {
                 waitUntilElapsedRealtime(executeAtElapsedRealtimeMs)
             }
             when (command) {
+                RemoteCommand.PREPARE -> prepareLocalPlayback(startPositionMs)
                 RemoteCommand.PLAY -> startLocalPlayback(startPositionMs, mode, executeAtWallClockMs, executeAtElapsedRealtimeMs)
                 RemoteCommand.PAUSE -> pauseLocalPlayback(status = "已暂停")
                 RemoteCommand.STOP -> stopLocalPlayback(status = "已停止")
                 RemoteCommand.IDLE -> Unit
             }
+        }
+    }
+
+    private fun prepareLocalPlayback(startPositionMs: Long) {
+        val duration = _uiState.value.durationMs
+        if (duration <= 0L) return
+        val targetPosition = startPositionMs.coerceIn(0L, duration)
+        if (targetPosition < duration) {
+            preSeekServerPlayerAt(targetPosition)
+        }
+        synchronized(playbackLock) {
+            pausedPositionMs = targetPosition
+            isPlaying = false
+        }
+        _uiState.update {
+            it.copy(
+                isPlaying = false,
+                playbackPositionMs = targetPosition,
+                status = "网络信号同步预热中...",
+                errorMessage = null
+            )
         }
     }
 
@@ -615,6 +665,7 @@ class BandSyncServer(context: Context) : AutoCloseable {
             Thread.currentThread().interrupt()
         } finally {
             eventClients.remove(id, eventClient)
+            eventClient.sendJob?.cancel()
         }
     }
 
@@ -654,10 +705,21 @@ class BandSyncServer(context: Context) : AutoCloseable {
 
     private fun broadcastSnapshot() {
         if (eventClients.isEmpty()) return
-        val snapshot = playbackStateJson()
-        ioScope.launch {
-            eventClients.values.forEach { client ->
-                if (!sendEvent(client, snapshot)) {
+        val payload = eventPayload(playbackStateJson())
+        eventClients.values.forEach { client ->
+            queueEvent(client, payload)
+        }
+    }
+
+    private fun eventPayload(json: JSONObject): ByteArray =
+        (json.toString() + "\n").toByteArray(Charsets.UTF_8)
+
+    private fun queueEvent(client: EventClient, payload: ByteArray) {
+        synchronized(client) {
+            val previousJob = client.sendJob
+            client.sendJob = ioScope.launch {
+                previousJob?.join()
+                if (!sendEvent(client, payload)) {
                     eventClients.remove(client.id, client)
                 }
             }
@@ -665,9 +727,12 @@ class BandSyncServer(context: Context) : AutoCloseable {
     }
 
     private fun sendEvent(client: EventClient, json: JSONObject): Boolean =
+        sendEvent(client, eventPayload(json))
+
+    private fun sendEvent(client: EventClient, payload: ByteArray): Boolean =
         try {
             synchronized(client) {
-                client.output.write((json.toString() + "\n").toByteArray(Charsets.UTF_8))
+                client.output.write(payload)
                 client.output.flush()
             }
             true
@@ -777,9 +842,24 @@ class BandSyncServer(context: Context) : AutoCloseable {
             }
             player.start()
             val actualStartElapsedMs = SystemClock.elapsedRealtime()
-            val startDeltaMs = actualStartElapsedMs - targetElapsedMs
-            _uiState.update {
-                it.copy(status = "正在播放（本机开始偏差 ${startDeltaMs.formatSignedMs()}）")
+            if (targetElapsedMs > 0L) {
+                val startDeltaMs = actualStartElapsedMs - targetElapsedMs
+                _uiState.update {
+                    it.copy(status = "正在播放（本机开始偏差 ${startDeltaMs.formatSignedMs()}）")
+                }
+            }
+        }
+    }
+
+    private fun preSeekServerPlayerAt(positionMs: Long) {
+        val player = serverPlayer ?: return
+        if (!serverPlayerPrepared) return
+        runCatching {
+            val serverAudioDuration = _uiState.value.serverAudio?.durationMs ?: 0L
+            if (serverAudioDuration <= 0L || positionMs >= serverAudioDuration) return@runCatching
+            if (player.isPlaying) player.pause()
+            if (kotlin.math.abs(player.currentPosition.toLong() - positionMs) > PRE_SEEK_TOLERANCE_MS) {
+                seekToCompat(player, positionMs)
             }
         }
     }
@@ -1092,6 +1172,8 @@ class BandSyncServer(context: Context) : AutoCloseable {
         executeAtWallClockMs: Long
     ): String =
         when (command) {
+            RemoteCommand.PREPARE -> "网络信号同步预热中，稍后下发开始命令"
+
             RemoteCommand.PLAY -> if (mode == PlaybackSyncMode.DEVICE_TIME && executeAtWallClockMs > 0L) {
                 "已下发开始命令，将在设备时间 $executeAtWallClockMs 执行"
             } else {
@@ -1148,11 +1230,13 @@ class BandSyncServer(context: Context) : AutoCloseable {
     private data class EventClient(
         val id: String,
         val socket: Socket,
-        val output: OutputStream
+        val output: OutputStream,
+        var sendJob: Job? = null
     )
 
     private companion object {
         const val DEVICE_TIME_COMMAND_LEAD_MS = 3_000L
+        const val NETWORK_SIGNAL_WARMUP_MS = 300L
         const val BASE_READY_TIME_SYNC_ERROR_MS = 500L
         const val MIN_READY_TIME_SYNC_ERROR_MS = 250L
         const val MAX_READY_TIME_SYNC_ERROR_MS = 1_500L

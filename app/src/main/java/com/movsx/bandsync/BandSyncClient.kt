@@ -397,13 +397,14 @@ class BandSyncClient(context: Context) : AutoCloseable {
         if (player == null || currentAudioRevision != snapshot.audioRevision) {
             prepareLocalPlayer(snapshot.audioRevision)
         }
-        preSeekForScheduledPlayback(snapshot)
+        preSeekForPlayback(snapshot)
         applyRemoteCommandIfReady(snapshot)
     }
 
     private fun statusForSnapshot(snapshot: RemoteControlSnapshot): String =
         when {
             !snapshot.hasClientAudio -> "已连接，等待服务端加载 Clients Output"
+            snapshot.command == RemoteCommand.PREPARE -> "网络信号同步预热中"
             cacheStatus == "downloading" -> "正在缓存整首音频 $cacheProgressPercent%"
             cachedAudioRevision == snapshot.audioRevision -> if (_uiState.value.isPlaying) {
                 "正在按服务端命令播放"
@@ -477,14 +478,20 @@ class BandSyncClient(context: Context) : AutoCloseable {
         }
     }
 
-    private fun preSeekForScheduledPlayback(snapshot: RemoteControlSnapshot) {
-        if (snapshot.command != RemoteCommand.PLAY || snapshot.syncMode != PlaybackSyncMode.DEVICE_TIME) return
+    private fun preSeekForPlayback(snapshot: RemoteControlSnapshot) {
+        val isDeviceTimePlay = snapshot.command == RemoteCommand.PLAY &&
+            snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME
+        val isNetworkWarmup = snapshot.command == RemoteCommand.PREPARE &&
+            snapshot.syncMode == PlaybackSyncMode.NETWORK_SIGNAL
+        if (!isDeviceTimePlay && !isNetworkWarmup) return
         val mediaPlayer = player ?: return
         if (!playerReady || snapshot.durationMs <= 0L) return
 
-        val targetElapsedMs = correctedTargetElapsedRealtimeMs(snapshot.executeAtWallClockMs) ?: return
-        val remainingMs = targetElapsedMs - SystemClock.elapsedRealtime()
-        if (remainingMs !in PRE_SEEK_MIN_LEAD_MS..PRE_SEEK_MAX_LEAD_MS) return
+        if (isDeviceTimePlay) {
+            val targetElapsedMs = correctedTargetElapsedRealtimeMs(snapshot.executeAtWallClockMs) ?: return
+            val remainingMs = targetElapsedMs - SystemClock.elapsedRealtime()
+            if (remainingMs !in PRE_SEEK_MIN_LEAD_MS..PRE_SEEK_MAX_LEAD_MS) return
+        }
 
         runCatching {
             val target = snapshot.startPositionMs.coerceIn(0L, snapshot.durationMs)
@@ -495,8 +502,9 @@ class BandSyncClient(context: Context) : AutoCloseable {
     private fun applyRemoteCommandIfReady(snapshot: RemoteControlSnapshot) {
         if (snapshot.commandId <= lastAppliedCommandId) return
 
+        val commandNeedsAudio = snapshot.command == RemoteCommand.PLAY || snapshot.command == RemoteCommand.PREPARE
         val delayBeforeTargetMs = if (
-            snapshot.command == RemoteCommand.PLAY &&
+            commandNeedsAudio &&
             snapshot.syncMode == PlaybackSyncMode.DEVICE_TIME &&
             snapshot.executeAtWallClockMs > 0L
         ) {
@@ -505,15 +513,14 @@ class BandSyncClient(context: Context) : AutoCloseable {
             Long.MAX_VALUE
         }
 
-        if (snapshot.command == RemoteCommand.PLAY) {
+        if (commandNeedsAudio) {
             if (cachedAudioRevision != snapshot.audioRevision || cachedAudioFile?.exists() != true) {
-                _uiState.update { it.copy(status = "已收到开始命令，等待缓存完成") }
+                _uiState.update { it.copy(status = "已收到播放预备命令，等待缓存完成") }
                 return
             }
             if (player == null || currentAudioRevision != snapshot.audioRevision) {
-                lastAppliedCommandId = snapshot.commandId
                 prepareLocalPlayer(snapshot.audioRevision)
-                return
+                if (player == null || !playerReady) return
             }
             if (!playerReady && delayBeforeTargetMs > MIN_PREPARE_WAIT_BEFORE_TARGET_MS) return
         }
@@ -537,10 +544,33 @@ class BandSyncClient(context: Context) : AutoCloseable {
             }
             waitUntilCommandTime(snapshot)
             when (snapshot.command) {
+                RemoteCommand.PREPARE -> prepareLocalPlayback(snapshot)
                 RemoteCommand.PLAY -> startLocalPlayback(snapshot)
                 RemoteCommand.PAUSE -> pauseLocalPlayback("已按服务端命令暂停")
                 RemoteCommand.STOP -> stopLocalPlayback("已按服务端命令停止")
                 RemoteCommand.IDLE -> Unit
+            }
+        }
+    }
+
+    private fun prepareLocalPlayback(snapshot: RemoteControlSnapshot) {
+        val mediaPlayer = player ?: return
+        if (!playerReady || snapshot.durationMs <= 0L) return
+        val target = snapshot.startPositionMs.coerceIn(0L, snapshot.durationMs)
+        runCatching {
+            if (mediaPlayer.isPlaying) mediaPlayer.pause()
+            if (target < snapshot.durationMs &&
+                kotlin.math.abs(mediaPlayer.currentPosition.toLong() - target) > PRE_SEEK_TOLERANCE_MS
+            ) {
+                seekToCompat(mediaPlayer, target)
+            }
+            _uiState.update {
+                it.copy(
+                    isPlaying = false,
+                    playbackPositionMs = target,
+                    status = "网络信号同步预热中",
+                    errorMessage = null
+                )
             }
         }
     }
